@@ -33,27 +33,22 @@ hook captures both from the app's own traffic (`window.__pajeAuth` /
 authenticated call, the CLI keeps the session alive on its own (useful: the site
 itself leaks memory and freezes after a few minutes, but the CLI carries on).
 
-## Setup (once per Chrome session)
+## Usage
 
-1. Launch Chrome with the DevTools port and a dedicated profile (macOS):
+Nothing to launch by hand. The first command auto-starts a **dedicated debug
+Chrome** (persistent profile `~/.pajemploi-chrome`, coexists with your normal
+Chrome) and opens Pajemploi:
 
-   ```bash
-   "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome" \
-     --remote-debugging-port=9222 \
-     --user-data-dir="$HOME/.pajemploi-chrome"
-   ```
+```bash
+bin/paje doctor        # or straight to bin/paje salaries
+```
 
-2. In that Chrome, log in to https://pajemploi.urssaf.fr **by hand**.
-3. Confirm the bridge:
+If you're not logged in, log in **by hand** in the Chrome window that opens, then
+re-run — the dedicated profile keeps the session between runs, so you only log in
+when it expires. A `401/403` later means the session expired; log in again there.
 
-   ```bash
-   bin/paje doctor
-   # CDP: http://localhost:9222 — N targets
-   # tab: https://pajemploi.urssaf.fr/employeur/...
-   # x-auth-token captured: yes (36 chars) — ready.
-   ```
-
-Override the endpoint with `--cdp-url` or `PAJE_CDP_URL` if you use another port.
+Options: `--cdp-url` / `PAJE_CDP_URL` (other port), `--no-launch` (don't auto-start
+Chrome), `--no-reload`.
 
 ## Commands
 

@@ -21,24 +21,22 @@ l'onglet connecté, la CLI se débrouille seule — utile puisque le site fuit l
 mémoire et **freeze au bout de ~3 min** : tu te connectes à la main, la CLI prend
 le relais.
 
-## Setup (une fois par session Chrome)
+## Utilisation
 
-1. Lance Chrome avec le port DevTools et un profil dédié (macOS) :
+Rien à lancer à la main. La première commande démarre au besoin un **Chrome
+dédié** (profil persistant `~/.pajemploi-chrome`) et ouvre Pajemploi :
 
-   ```bash
-   "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome" \
-     --remote-debugging-port=9222 \
-     --user-data-dir="$HOME/.pajemploi-chrome"
-   ```
+```bash
+./bin/paje doctor        # ou directement ./bin/paje salaries
+```
 
-2. Dans ce Chrome, connecte-toi à https://pajemploi.urssaf.fr **à la main**.
-3. Vérifie le pont :
+- **Pas connecté ?** Connecte-toi dans la fenêtre Chrome qui s'ouvre, puis
+  relance. Le profil dédié **garde ta session** entre les runs (tu ne te
+  reconnectes que quand elle expire) et coexiste avec ton Chrome habituel.
+- Un `401/403` = session expirée → reconnecte-toi dans cette fenêtre.
 
-   ```bash
-   ./bin/paje doctor
-   ```
-
-Port différent ? `--cdp-url` ou `PAJE_CDP_URL`.
+Options : `--cdp-url` / `PAJE_CDP_URL` (autre port), `--no-launch` (ne pas
+démarrer Chrome automatiquement), `--no-reload`.
 
 ## Commandes
 

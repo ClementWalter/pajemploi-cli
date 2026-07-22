@@ -66,3 +66,16 @@ def test_build_call_expr_null_body_for_get(paje):
 def test_build_call_expr_serializes_payload(paje):
     expr = paje._build_call_expr("/x", "POST", {"a": 1})
     assert '{"a": 1}' in expr
+
+
+@pytest.mark.parametrize(
+    "url,expected",
+    [
+        ("http://localhost:9222", True),
+        ("http://127.0.0.1:9222", True),
+        ("http://10.0.0.5:9222", False),
+        ("https://example.com", False),
+    ],
+)
+def test_is_local(paje, url, expected):
+    assert paje._is_local(url) is expected

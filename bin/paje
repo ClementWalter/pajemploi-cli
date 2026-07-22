@@ -21,12 +21,10 @@ updates it from the response, so once the tab has issued one authenticated call
 the CLI keeps the session going on its own — handy since the site itself leaks
 memory and freezes after a few minutes.
 
-Setup (once per Chrome session):
-  1. Launch Chrome with the DevTools port, e.g. on macOS:
-       "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome" \\
-         --remote-debugging-port=9222 --user-data-dir="$HOME/.pajemploi-chrome"
-  2. In that Chrome, log in to https://pajemploi.urssaf.fr (by hand).
-  3. Run `paje doctor` to confirm the tab is found and a token was captured.
+Usage: nothing to launch by hand. The first command auto-starts a dedicated
+debug Chrome (persistent profile ~/.pajemploi-chrome, coexists with your normal
+Chrome) opening Pajemploi. Log in by hand in that window if needed, then re-run;
+the profile keeps the session between runs. `--no-launch` disables auto-start.
 
 NOTE: the salarié NIR (numéro de sécurité sociale) is masked server-side by the
 URSSAF (e.g. ``2***********XXX``); it is NOT recoverable through this API.
@@ -38,8 +36,11 @@ import base64
 import json
 import logging
 import os
+import shutil
+import subprocess
 import sys
 import time
+import urllib.parse
 import urllib.request
 from pathlib import Path
 
@@ -50,6 +51,15 @@ import websocket  # websocket-client
 DEFAULT_CDP = os.environ.get("PAJE_CDP_URL", "http://localhost:9222")
 PAJE_ORIGIN = "https://pajemploi.urssaf.fr"
 API_BASE = "https://api.urssaf.fr/paje/apaj/v1"
+
+# Dedicated Chrome profile the CLI launches on demand. It persists between runs
+# (cookies, device trust) so you don't re-log-in every time, and lets this Chrome
+# coexist with your normal one (which can't expose a debug port while running).
+PROFILE_DIR = Path.home() / ".pajemploi-chrome"
+CHROME_PATHS = [
+    "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+    "/Applications/Chromium.app/Contents/MacOS/Chromium",
+]
 
 logging.basicConfig(
     level=os.environ.get("PAJE_LOG", "WARNING").upper(),
@@ -136,15 +146,64 @@ def _http_json(url: str):
         return json.loads(resp.read().decode())
 
 
-def _list_targets(cdp_url: str) -> list[dict]:
-    """Fetch CDP targets, turning connection failures into a clean message."""
+def _targets_or_none(cdp_url: str) -> list[dict] | None:
     try:
         return _http_json(cdp_url.rstrip("/") + "/json")
-    except Exception as exc:
+    except Exception:
+        return None
+
+
+def _is_local(cdp_url: str) -> bool:
+    host = urllib.parse.urlparse(cdp_url).hostname or ""
+    return host in ("localhost", "127.0.0.1", "::1")
+
+
+def _chrome_binary() -> str | None:
+    for p in CHROME_PATHS:
+        if Path(p).exists():
+            return p
+    for name in ("google-chrome", "google-chrome-stable", "chromium", "chromium-browser", "chrome"):
+        found = shutil.which(name)
+        if found:
+            return found
+    return None
+
+
+def _launch_chrome(cdp_url: str) -> None:
+    """Start the dedicated debug Chrome (opening Pajemploi) if it isn't already up."""
+    binary = _chrome_binary()
+    if not binary:
         raise click.ClickException(
-            f"Can't reach Chrome DevTools at {cdp_url} ({exc}). Launch Chrome with "
-            '--remote-debugging-port=9222 (see `paje doctor` / the SKILL setup).'
+            "Chrome introuvable automatiquement. Lance-le à la main :\n"
+            '  "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome" '
+            f"--remote-debugging-port={urllib.parse.urlparse(cdp_url).port or 9222} "
+            f'--user-data-dir="{PROFILE_DIR}"'
         )
+    port = urllib.parse.urlparse(cdp_url).port or 9222
+    logger.debug("launching %s on port %s", binary, port)
+    subprocess.Popen(
+        [binary, f"--remote-debugging-port={port}", f"--user-data-dir={PROFILE_DIR}",
+         "--no-first-run", "--no-default-browser-check", PAJE_ORIGIN],
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True,
+    )
+
+
+def _list_targets(cdp_url: str, auto_launch: bool = True) -> list[dict]:
+    """Fetch CDP targets, launching the dedicated Chrome on demand if none is up."""
+    targets = _targets_or_none(cdp_url)
+    if targets is not None:
+        return targets
+    if not (auto_launch and _is_local(cdp_url)):
+        raise click.ClickException(
+            f"Can't reach Chrome DevTools at {cdp_url}. Start it (or drop --no-launch)."
+        )
+    _launch_chrome(cdp_url)
+    for _ in range(30):  # ~15s for Chrome to open the debug port
+        time.sleep(0.5)
+        targets = _targets_or_none(cdp_url)
+        if targets is not None:
+            return targets
+    raise click.ClickException("Launched Chrome but the DevTools port never came up.")
 
 
 def _pick_target(targets: list[dict]) -> dict | None:
@@ -195,12 +254,13 @@ class _CDP:
             pass
 
 
-def _connect(cdp_url: str) -> _CDP:
-    targets = _list_targets(cdp_url)
+def _connect(cdp_url: str, auto_launch: bool = True) -> _CDP:
+    targets = _list_targets(cdp_url, auto_launch)
     target = _pick_target(targets)
     if not target:
         raise click.ClickException(
-            f"No pajemploi.urssaf.fr tab found in Chrome at {cdp_url}. Open one and log in."
+            "Chrome est prêt mais aucun onglet Pajemploi connecté. Connecte-toi à "
+            "https://pajemploi.urssaf.fr dans la fenêtre Chrome qui vient de s'ouvrir, puis relance."
         )
     logger.debug("attaching to %s", target.get("url"))
     return _CDP(target["webSocketDebuggerUrl"])
@@ -276,14 +336,16 @@ def _emit(data, as_json: bool, render) -> None:
 @click.option("--cdp-url", default=DEFAULT_CDP, show_default=True, help="Chrome DevTools base URL.")
 @click.option("--reload/--no-reload", "allow_reload", default=True,
               help="Reload the tab to capture a token if none is live yet.")
+@click.option("--launch/--no-launch", "auto_launch", default=True,
+              help="Auto-start the dedicated debug Chrome if none is reachable.")
 @click.pass_context
-def cli(ctx: click.Context, cdp_url: str, allow_reload: bool) -> None:
+def cli(ctx: click.Context, cdp_url: str, allow_reload: bool, auto_launch: bool) -> None:
     """Drive your logged-in Pajemploi tab (salariés, fiches, documents, bulletins)."""
-    ctx.obj = {"cdp_url": cdp_url, "allow_reload": allow_reload}
+    ctx.obj = {"cdp_url": cdp_url, "allow_reload": allow_reload, "auto_launch": auto_launch}
 
 
 def _session(ctx: click.Context) -> _CDP:
-    cdp = _connect(ctx.obj["cdp_url"])
+    cdp = _connect(ctx.obj["cdp_url"], ctx.obj["auto_launch"])
     _ensure_token(cdp, ctx.obj["allow_reload"])
     return cdp
 
@@ -293,11 +355,13 @@ def _session(ctx: click.Context) -> _CDP:
 def doctor(ctx: click.Context) -> None:
     """Check the DevTools connection, the Pajemploi tab, and token capture."""
     cdp_url = ctx.obj["cdp_url"]
-    targets = _list_targets(cdp_url)
+    targets = _list_targets(cdp_url, ctx.obj["auto_launch"])
     click.echo(f"CDP: {cdp_url} — {len(targets)} targets")
     target = _pick_target(targets)
     if not target:
-        raise click.ClickException("No pajemploi.urssaf.fr tab. Open one and log in.")
+        raise click.ClickException(
+            "Chrome prêt mais pas d'onglet Pajemploi connecté — connecte-toi dans la fenêtre puis relance."
+        )
     click.echo(f"tab: {target.get('url')}")
     cdp = _CDP(target["webSocketDebuggerUrl"])
     xat = _ensure_token(cdp, ctx.obj["allow_reload"])
