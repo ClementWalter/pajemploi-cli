@@ -26,11 +26,12 @@ logged-in `pajemploi.urssaf.fr` tab. That reuses the page's genuine browser
 fingerprint (passes the WAF) and its **live session token** (nothing to capture
 or paste).
 
-The API auth is a rolling `x-auth-token` header the server rotates on every
-response; an injected hook keeps the latest value in `window.__pajeXat`, and each
-call the CLI makes rolls it forward — so once the tab has made one authenticated
-call, the CLI keeps the session alive on its own (useful: the site itself leaks
-memory and freezes after a few minutes, but the CLI carries on).
+The API requires **two** headers: `authorization: Bearer <…>` and a rolling
+`x-auth-token` (the server rotates the latter on every response). An injected
+hook captures both from the app's own traffic (`window.__pajeAuth` /
+`window.__pajeXat`) and the CLI replays them — so once the tab has made one
+authenticated call, the CLI keeps the session alive on its own (useful: the site
+itself leaks memory and freezes after a few minutes, but the CLI carries on).
 
 ## Setup (once per Chrome session)
 
@@ -85,8 +86,9 @@ The URSSAF masks the NIR everywhere on the employer side:
 
 ## API contract (for maintenance)
 
-All on `https://api.urssaf.fr/paje/apaj/v1`, single header `x-auth-token`
-(rotated in each response's `x-auth-token` header):
+All on `https://api.urssaf.fr/paje/apaj/v1`, headers `authorization: Bearer <…>`
++ `x-auth-token` (the latter rotated in each response's `x-auth-token` header;
+don't send `content-type` on a bodyless GET — the preflight is rejected):
 
 - `POST /employeur/salaries/rechercher` — body `{"isActif":null,"typeActivite":"","idSalarie":"","ecranAgrement":"ECRAN_LISTE_SALARIES"}`
 - `GET  /salarie?idSalarie=<id>` — fiche (numNir masked)

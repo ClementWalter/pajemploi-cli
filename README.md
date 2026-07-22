@@ -13,11 +13,13 @@ s'attache donc à un vrai Chrome via le **DevTools Protocol (CDP)** et lance
 chaque appel **dans un onglet Pajemploi connecté** : elle réutilise l'empreinte
 navigateur (passe le WAF) et **la session vivante** (rien à coller).
 
-Le jeton `x-auth-token` est **glissant** (le serveur en renvoie un neuf à chaque
-réponse) ; un hook injecté garde le dernier dans `window.__pajeXat` et la CLL le
-fait tourner elle-même. Une fois l'onglet connecté, la CLI continue seule — utile
-puisque le site fuit la mémoire et **freeze au bout de ~3 min** : tu te connectes
-à la main, la CLI prend le relais.
+L'API exige **deux** en-têtes : `authorization: Bearer <…>` **et** `x-auth-token`
+(~36c). Le `x-auth-token` est **glissant** (le serveur en renvoie un neuf à chaque
+réponse). Un hook injecté dans la page capture les deux (`window.__pajeAuth` et
+`window.__pajeXat`) depuis le trafic de l'app, et la CLI les rejoue. Une fois
+l'onglet connecté, la CLI se débrouille seule — utile puisque le site fuit la
+mémoire et **freeze au bout de ~3 min** : tu te connectes à la main, la CLI prend
+le relais.
 
 ## Setup (une fois par session Chrome)
 
