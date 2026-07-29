@@ -1,6 +1,6 @@
 ---
 name: pajemploi-cli
-description: "Drive your own Pajemploi (URSSAF) employer space from the terminal via the bundled `bin/paje` command — list salariés, read fiches, list declarations/documents, and download bulletins de salaire (PDF). Because api.urssaf.fr sits behind a WAF that resets non-browser HTTP clients (even curl_cffi Chrome impersonation), the CLI attaches over the Chrome DevTools Protocol to a REAL, already-logged-in Chrome tab and runs the API calls inside the page — reusing the browser's fingerprint (passes the WAF) and the live session (nothing to paste). The CLI auto-launches a dedicated debug Chrome (persistent profile) on demand and opens Pajemploi; the user just logs in by hand in that window when the session expires. Use when the user wants to list/read their Pajemploi salariés, fiches, declarations, or download bulletins de salaire. Note: the salarié NIR (numéro de sécurité sociale) is masked server-side and not recoverable via this API."
+description: "Drive your own Pajemploi (URSSAF) employer space from the terminal via the bundled `paje` command — list salariés, read fiches, list declarations/documents, and download bulletins de salaire (PDF). Because api.urssaf.fr sits behind a WAF that resets non-browser HTTP clients (even curl_cffi Chrome impersonation), the CLI attaches over the Chrome DevTools Protocol to a REAL, already-logged-in Chrome tab and runs the API calls inside the page — reusing the browser's fingerprint (passes the WAF) and the live session (nothing to paste). The CLI auto-launches a dedicated debug Chrome (persistent profile) on demand and opens Pajemploi; the user just logs in by hand in that window when the session expires. Use when the user wants to list/read their Pajemploi salariés, fiches, declarations, or download bulletins de salaire. Note: the salarié NIR (numéro de sécurité sociale) is masked server-side and not recoverable via this API."
 ---
 
 # pajemploi-cli
@@ -11,9 +11,21 @@ salariés, fiches, documents, bulletins de salaire — by running the private
 
 ## How to invoke
 
-Run the bundled launcher **`bin/paje`** (PEP 723 — `uv` resolves deps inline on
-first run). Resolve `bin/paje` against this skill's directory; from elsewhere use
-the absolute path.
+Invoke it as **`paje`** — on `$PATH` via a symlink in `~/.local/bin` onto this
+repo's `bin/paje`, so it always runs the current checkout: a `git pull`, or even
+an uncommitted edit, takes effect immediately with nothing to reinstall.
+
+```bash
+paje salaries
+```
+
+Examples in this doc are written that way. If `paje` is not on `$PATH`, run the
+bundled launcher `bin/paje` resolved against this skill's own directory (PEP 723
+— `uv` resolves deps inline on first run), or link it once:
+
+```bash
+ln -sfn <skill-dir>/bin/paje ~/.local/bin/paje
+```
 
 ## Why it drives a browser (not plain HTTP)
 
@@ -40,7 +52,7 @@ Chrome** (persistent profile `~/.pajemploi-chrome`, coexists with your normal
 Chrome) and opens Pajemploi:
 
 ```bash
-bin/paje doctor        # or straight to bin/paje salaries
+paje doctor        # or straight to bin/paje salaries
 ```
 
 If you're not logged in, log in **by hand** in the Chrome window that opens, then
@@ -52,22 +64,22 @@ Chrome), `--no-reload`.
 
 ## Commands
 
-### `bin/paje doctor`
+### `paje doctor`
 Check the DevTools connection, that a Pajemploi tab is found, and that a session
 token was captured (reloads the tab once if the token isn't live yet).
 
-### `bin/paje salaries [--json]`
+### `paje salaries [--json]`
 List all salariés (id, nom, prénom, activité, actif, NIR certifié CNAV or not).
 
-### `bin/paje salarie <idSalarie> [--json]`
+### `paje salarie <idSalarie> [--json]`
 Detailed fiche: civilité, naissance, lieu, adresse, email — and `numNir`
 **masked by the URSSAF** (see below).
 
-### `bin/paje documents [--type BS] [--from YYYY-MM] [--to YYYY-MM] [--salarie NAME] [--json]`
+### `paje documents [--type BS] [--from YYYY-MM] [--to YYYY-MM] [--salarie NAME] [--json]`
 List documents over a period range. `--type BS` = bulletin de salaire. Each row
 gives the `idDeclaration` used to download the PDF.
 
-### `bin/paje bulletin <idDeclaration> [-o PATH] [--rang N]`
+### `paje bulletin <idDeclaration> [-o PATH] [--rang N]`
 Generate and save the bulletin de salaire PDF (base64 → file).
 
 Global options: `--cdp-url`, and `--no-reload` (don't reload the tab to capture a
