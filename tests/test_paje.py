@@ -1,7 +1,14 @@
 #!/usr/bin/env -S uv run --script
 # /// script
 # requires-python = ">=3.11"
-# dependencies = ["click>=8.1", "websocket-client>=1.7", "pytest>=8.0"]
+# dependencies = [
+#     "click==8.3.3",
+#     "websocket-client==1.9.2",
+#     "pytest==9.1.1",
+# ]
+#
+# [tool.uv]
+# exclude-newer = "2026-10-27T00:00:00Z"
 # ///
 """Unit tests for the pure logic of the paje CLI.
 
@@ -17,7 +24,7 @@ from pathlib import Path
 
 import pytest
 
-_MODULE_PATH = Path(__file__).resolve().parent.parent / "bin" / "paje"
+_MODULE_PATH = Path(__file__).resolve().parent.parent / "pajemploi_cli.py"
 
 
 @pytest.fixture(scope="module")
@@ -79,3 +86,7 @@ def test_build_call_expr_serializes_payload(paje):
 )
 def test_is_local(paje, url, expected):
     assert paje._is_local(url) is expected
+
+
+if __name__ == "__main__":
+    raise SystemExit(pytest.main([__file__, "-q"]))

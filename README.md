@@ -1,5 +1,7 @@
 # pajemploi-cli
 
+**Visibility: public.**
+
 Piloter ton espace **employeur Pajemploi (URSSAF)** depuis le terminal —
 salariés, fiches, documents, bulletins de salaire — en exécutant les appels de
 l'API privée `https://api.urssaf.fr/paje/apaj/v1` **dans ton vrai Chrome**.
@@ -61,5 +63,5 @@ L'URSSAF masque le NIR côté employeur :
 ## Tests
 
 ```bash
-uv run --with pytest --with click --with websocket-client python -m pytest tests/ -q
+uv run --script tests/test_paje.py
 ```

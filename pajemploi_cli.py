@@ -1,0 +1,493 @@
+#!/usr/bin/env -S uv run --script
+# /// script
+# requires-python = ">=3.11"
+# dependencies = [
+#     "click==8.3.3",
+#     "websocket-client==1.9.2",
+# ]
+#
+# [tool.uv]
+# exclude-newer = "2026-10-27T00:00:00Z"
+# ///
+"""pajemploi-cli — drive your own Pajemploi (URSSAF) employer space from the terminal.
+
+Why this talks to a browser instead of doing plain HTTP: `api.urssaf.fr` sits
+behind a WAF that fingerprints the TLS/HTTP client and resets the connection for
+anything that isn't a real browser — plain requests, curl, and even
+curl_cffi's Chrome impersonation all get "connection reset", while Chrome
+itself succeeds. So this CLI attaches to a **real Chrome** over the DevTools
+Protocol (CDP) and runs the API calls *inside* a logged-in pajemploi.urssaf.fr
+tab. That reuses the page's real browser fingerprint (passes the WAF) and its
+live session token (nothing to paste).
+
+Session model: the API is authenticated by a rolling `x-auth-token` header that
+the SPA sends and the server rotates on every response. An injected hook records
+the latest value into `window.__pajeXat`; each call this CLI makes reads it and
+updates it from the response, so once the tab has issued one authenticated call
+the CLI keeps the session going on its own — handy since the site itself leaks
+memory and freezes after a few minutes.
+
+Usage: nothing to launch by hand. The first command auto-starts a dedicated
+debug Chrome (persistent profile ~/.pajemploi-chrome, coexists with your normal
+Chrome) opening Pajemploi. Log in by hand in that window if needed, then re-run;
+the profile keeps the session between runs. `--no-launch` disables auto-start.
+
+NOTE: the salarié NIR (numéro de sécurité sociale) is masked server-side by the
+URSSAF (e.g. ``2***********XXX``); it is NOT recoverable through this API.
+"""
+
+from __future__ import annotations
+
+import base64
+import json
+import logging
+import os
+import shutil
+import subprocess
+import sys
+import time
+import urllib.parse
+import urllib.request
+from pathlib import Path
+
+import click
+import websocket  # websocket-client
+
+# Default DevTools endpoint; override with --cdp-url or PAJE_CDP_URL.
+DEFAULT_CDP = os.environ.get("PAJE_CDP_URL", "http://localhost:9222")
+PAJE_ORIGIN = "https://pajemploi.urssaf.fr"
+API_BASE = "https://api.urssaf.fr/paje/apaj/v1"
+
+# Dedicated Chrome profile the CLI launches on demand. It persists between runs
+# (cookies, device trust) so you don't re-log-in every time, and lets this Chrome
+# coexist with your normal one (which can't expose a debug port while running).
+PROFILE_DIR = Path.home() / ".pajemploi-chrome"
+CHROME_PATHS = [
+    "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+    "/Applications/Chromium.app/Contents/MacOS/Chromium",
+]
+
+logging.basicConfig(
+    level=os.environ.get("PAJE_LOG", "WARNING").upper(),
+    format="%(levelname)s %(message)s",
+    stream=sys.stderr,
+)
+logger = logging.getLogger("paje")
+
+# Injected into the page (idempotent). Hooks fetch + XHR to keep the latest
+# x-auth-token in window.__pajeXat, so the CLI never has to read it out of the
+# app's (encrypted) storage — it just piggybacks on whatever token the SPA uses.
+HOOK_JS = r"""
+(function(){
+  if (window.__pajeHookV >= 3) return;
+  window.__pajeHookV = 3;
+  // The data API needs BOTH headers: a Bearer `authorization` (stable-ish) and
+  // `x-auth-token` (rotated by the server in each response). Capture both.
+  var sx = function(v){ if (v) window.__pajeXat = v; };
+  var sa = function(v){ if (v) window.__pajeAuth = v; };
+  var O = XMLHttpRequest.prototype.setRequestHeader;
+  XMLHttpRequest.prototype.setRequestHeader = function(k, v){
+    try {
+      var kk = String(k).toLowerCase();
+      if (kk === "x-auth-token") sx(v);
+      else if (kk === "authorization") sa(v);
+    } catch(e){}
+    return O.apply(this, arguments);
+  };
+  var S = XMLHttpRequest.prototype.send;
+  XMLHttpRequest.prototype.send = function(){
+    // x-auth-token rotates in the RESPONSE header; grab the freshly issued one.
+    try {
+      this.addEventListener("loadend", function(){
+        try { sx(this.getResponseHeader("x-auth-token")); } catch(e){}
+      });
+    } catch(e){}
+    return S.apply(this, arguments);
+  };
+  var F = window.fetch;
+  if (F) window.fetch = function(){
+    try {
+      var i = arguments[0], init = arguments[1] || {};
+      var h = new Headers((init && init.headers) || (i && i.headers) || {});
+      sx(h.get("x-auth-token")); sa(h.get("authorization"));
+    } catch(e){}
+    return F.apply(this, arguments).then(function(r){
+      try { sx(r.headers.get("x-auth-token")); } catch(e){}
+      return r;
+    });
+  };
+})();
+"""
+
+# In-page API call: read the rolling token, fetch, roll it forward, return JSON.
+_CALL_JS = r"""
+(async () => {
+  const URL = __URL__, METHOD = __METHOD__, BODY = __BODY__;
+  const xat = (window.__pajeXat && window.__pajeAuth) ? window.__pajeXat : null, auth = window.__pajeAuth || null;
+  if (!xat) return JSON.stringify({error: "NO_TOKEN"});
+  const headers = {"x-auth-token": xat, "accept": "application/json"};
+  if (auth) headers["authorization"] = auth;  // API requires the Bearer too
+  // Only declare a JSON content-type when there's a body: sending it on a GET
+  // adds a preflight the server rejects ("Failed to fetch").
+  if (BODY !== null) headers["content-type"] = "application/json";
+  const opt = {method: METHOD, headers: headers};
+  if (BODY !== null) opt.body = JSON.stringify(BODY);
+  let r;
+  try { r = await fetch(URL, opt); }
+  catch (e) { return JSON.stringify({error: "FETCH_FAILED", detail: String(e)}); }
+  const nv = r.headers.get("x-auth-token");
+  if (nv) window.__pajeXat = nv;
+  const text = await r.text();
+  return JSON.stringify({status: r.status, body: text});
+})()
+"""
+
+
+# ---------------------------------------------------------------------------
+# CDP plumbing
+# ---------------------------------------------------------------------------
+
+def _http_json(url: str):
+    with urllib.request.urlopen(url, timeout=10) as resp:
+        return json.loads(resp.read().decode())
+
+
+def _targets_or_none(cdp_url: str) -> list[dict] | None:
+    try:
+        return _http_json(cdp_url.rstrip("/") + "/json")
+    except Exception:
+        return None
+
+
+def _is_local(cdp_url: str) -> bool:
+    host = urllib.parse.urlparse(cdp_url).hostname or ""
+    return host in ("localhost", "127.0.0.1", "::1")
+
+
+def _chrome_binary() -> str | None:
+    for p in CHROME_PATHS:
+        if Path(p).exists():
+            return p
+    for name in ("google-chrome", "google-chrome-stable", "chromium", "chromium-browser", "chrome"):
+        found = shutil.which(name)
+        if found:
+            return found
+    return None
+
+
+def _launch_chrome(cdp_url: str) -> None:
+    """Start the dedicated debug Chrome (opening Pajemploi) if it isn't already up."""
+    binary = _chrome_binary()
+    if not binary:
+        raise click.ClickException(
+            "Chrome introuvable automatiquement. Lance-le à la main :\n"
+            '  "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome" '
+            f"--remote-debugging-port={urllib.parse.urlparse(cdp_url).port or 9222} "
+            f'--user-data-dir="{PROFILE_DIR}"'
+        )
+    port = urllib.parse.urlparse(cdp_url).port or 9222
+    logger.debug("launching %s on port %s", binary, port)
+    subprocess.Popen(
+        [binary, f"--remote-debugging-port={port}", f"--user-data-dir={PROFILE_DIR}",
+         "--no-first-run", "--no-default-browser-check", PAJE_ORIGIN],
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True,
+    )
+
+
+def _list_targets(cdp_url: str, auto_launch: bool = True) -> list[dict]:
+    """Fetch CDP targets, launching the dedicated Chrome on demand if none is up."""
+    targets = _targets_or_none(cdp_url)
+    if targets is not None:
+        return targets
+    if not (auto_launch and _is_local(cdp_url)):
+        raise click.ClickException(
+            f"Can't reach Chrome DevTools at {cdp_url}. Start it (or drop --no-launch)."
+        )
+    _launch_chrome(cdp_url)
+    for _ in range(30):  # ~15s for Chrome to open the debug port
+        time.sleep(0.5)
+        targets = _targets_or_none(cdp_url)
+        if targets is not None:
+            return targets
+    raise click.ClickException("Launched Chrome but the DevTools port never came up.")
+
+
+def _pick_target(targets: list[dict]) -> dict | None:
+    """Pick the logged-in Pajemploi page among CDP targets.
+
+    Prefers an app route (``/employeur``) over the marketing/login pages so we
+    attach to a tab that actually carries a session.
+    """
+    pages = [t for t in targets if t.get("type") == "page" and PAJE_ORIGIN in (t.get("url") or "")]
+    if not pages:
+        return None
+    pages.sort(key=lambda t: ("/employeur" in t.get("url", "")), reverse=True)
+    return pages[0]
+
+
+class _CDP:
+    """Minimal DevTools-Protocol client over a single tab websocket."""
+
+    def __init__(self, ws_url: str):
+        # Chrome rejects the CDP websocket handshake if an Origin header is sent,
+        # so suppress it. (No frame-size cap needed: websocket-client streams.)
+        self.ws = websocket.create_connection(ws_url, timeout=30, suppress_origin=True)
+        self._id = 0
+
+    def call(self, method: str, params: dict | None = None):
+        self._id += 1
+        mid = self._id
+        self.ws.send(json.dumps({"id": mid, "method": method, "params": params or {}}))
+        while True:  # skip event notifications until our reply comes back
+            msg = json.loads(self.ws.recv())
+            if msg.get("id") == mid:
+                if "error" in msg:
+                    raise click.ClickException(f"CDP {method}: {msg['error']}")
+                return msg.get("result", {})
+
+    def evaluate(self, expression: str, await_promise: bool = False):
+        res = self.call("Runtime.evaluate", {
+            "expression": expression, "awaitPromise": await_promise, "returnByValue": True,
+        })
+        if "exceptionDetails" in res:
+            raise click.ClickException(f"page error: {res['exceptionDetails'].get('text')}")
+        return res.get("result", {}).get("value")
+
+    def close(self):
+        try:
+            self.ws.close()
+        except Exception:
+            pass
+
+
+def _connect(cdp_url: str, auto_launch: bool = True) -> _CDP:
+    targets = _list_targets(cdp_url, auto_launch)
+    target = _pick_target(targets)
+    if not target:
+        raise click.ClickException(
+            "Chrome est prêt mais aucun onglet Pajemploi connecté. Connecte-toi à "
+            "https://pajemploi.urssaf.fr dans la fenêtre Chrome qui vient de s'ouvrir, puis relance."
+        )
+    logger.debug("attaching to %s", target.get("url"))
+    return _CDP(target["webSocketDebuggerUrl"])
+
+
+def _ensure_token(cdp: _CDP, allow_reload: bool = True) -> str:
+    """Install the hook and return a live x-auth-token, reloading the tab if needed.
+
+    The hook only captures tokens from calls made after it is installed, so on a
+    tab that's been idle we reload once (installing the hook via
+    addScriptToEvaluateOnNewDocument so it runs before app code) and wait for the
+    SPA's startup calls to surface a token.
+    """
+    cdp.call("Page.enable")
+    cdp.call("Runtime.enable")
+    cdp.call("Page.addScriptToEvaluateOnNewDocument", {"source": HOOK_JS})
+    cdp.evaluate(HOOK_JS)  # also install in the current document
+    xat = cdp.evaluate("(window.__pajeXat && window.__pajeAuth) ? window.__pajeXat : null")
+    if xat or not allow_reload:
+        if not xat:
+            raise click.ClickException(
+                "No x-auth-token captured yet. Click once in the Pajemploi tab (or run "
+                "with --reload) so the app issues a call, then retry."
+            )
+        return xat
+    cdp.call("Page.reload", {})
+    for _ in range(30):  # ~15s for the SPA to boot and fire its first call
+        time.sleep(0.5)
+        xat = cdp.evaluate("(window.__pajeXat && window.__pajeAuth) ? window.__pajeXat : null")
+        if xat:
+            return xat
+    raise click.ClickException(
+        "Reloaded the tab but no token appeared — is the session still logged in?"
+    )
+
+
+def _build_call_expr(path: str, method: str, payload) -> str:
+    url = API_BASE + path
+    return (
+        _CALL_JS.replace("__URL__", json.dumps(url))
+        .replace("__METHOD__", json.dumps(method))
+        .replace("__BODY__", json.dumps(payload) if payload is not None else "null")
+    )
+
+
+def _api(cdp: _CDP, path: str, method: str = "GET", payload=None):
+    """Run one API call inside the page and return the parsed JSON body."""
+    raw = cdp.evaluate(_build_call_expr(path, method, payload), await_promise=True)
+    out = json.loads(raw)
+    if out.get("error") == "NO_TOKEN":
+        raise click.ClickException("Session token lost — reload/log in again in the tab.")
+    if out.get("error"):
+        raise click.ClickException(f"in-page fetch failed: {out.get('detail', out['error'])}")
+    if out["status"] in (401, 403):
+        raise click.ClickException(f"Auth rejected ({out['status']}) — log in again in the tab.")
+    if not (200 <= out["status"] < 300):
+        raise click.ClickException(f"{method} {path} -> {out['status']}: {out['body'][:300]}")
+    return json.loads(out["body"])
+
+
+def _emit(data, as_json: bool, render) -> None:
+    if as_json:
+        click.echo(json.dumps(data, ensure_ascii=False, indent=2))
+    else:
+        render(data)
+
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+
+@click.group(
+    context_settings={"help_option_names": ["-h", "--help"]},
+    epilog="\b\nExamples:\n  paje doctor\n  paje salaries --json\n  paje --no-launch documents --from 2025-01",
+)
+@click.option("--cdp-url", default=DEFAULT_CDP, show_default=True, help="Chrome DevTools base URL.")
+@click.option("--reload/--no-reload", "allow_reload", default=True,
+              help="Reload the tab to capture a token if none is live yet.")
+@click.option("--launch/--no-launch", "auto_launch", default=True,
+              help="Auto-start the dedicated debug Chrome if none is reachable.")
+@click.pass_context
+def cli(ctx: click.Context, cdp_url: str, allow_reload: bool, auto_launch: bool) -> None:
+    """Drive your logged-in Pajemploi tab (salariés, fiches, documents, bulletins)."""
+    ctx.obj = {"cdp_url": cdp_url, "allow_reload": allow_reload, "auto_launch": auto_launch}
+
+
+def _session(ctx: click.Context) -> _CDP:
+    cdp = _connect(ctx.obj["cdp_url"], ctx.obj["auto_launch"])
+    _ensure_token(cdp, ctx.obj["allow_reload"])
+    return cdp
+
+
+@cli.command("doctor", epilog="\b\nExamples:\n  paje doctor\n  paje --cdp-url http://localhost:9223 doctor")
+@click.pass_context
+def doctor(ctx: click.Context) -> None:
+    """Check the DevTools connection, the Pajemploi tab, and token capture."""
+    cdp_url = ctx.obj["cdp_url"]
+    targets = _list_targets(cdp_url, ctx.obj["auto_launch"])
+    click.echo(f"CDP: {cdp_url} — {len(targets)} targets")
+    target = _pick_target(targets)
+    if not target:
+        raise click.ClickException(
+            "Chrome prêt mais pas d'onglet Pajemploi connecté — connecte-toi dans la fenêtre puis relance."
+        )
+    click.echo(f"tab: {target.get('url')}")
+    cdp = _CDP(target["webSocketDebuggerUrl"])
+    xat = _ensure_token(cdp, ctx.obj["allow_reload"])
+    click.echo(f"x-auth-token captured: yes ({len(xat)} chars) — ready.")
+    cdp.close()
+
+
+@cli.command("salaries", epilog="\b\nExamples:\n  paje salaries\n  paje salaries --json")
+@click.option("--json", "as_json", is_flag=True, help="Emit raw JSON.")
+@click.pass_context
+def salaries(ctx: click.Context, as_json: bool) -> None:
+    """List all salariés declared on the employer account."""
+    cdp = _session(ctx)
+    body = {"isActif": None, "typeActivite": "", "idSalarie": "", "ecranAgrement": "ECRAN_LISTE_SALARIES"}
+    data = _api(cdp, "/employeur/salaries/rechercher", "POST", body)
+    cdp.close()
+
+    def render(rows):
+        for r in rows:
+            s = r.get("salarie", {})
+            actif = "actif" if r.get("isActif") else "inactif"
+            cnav = "NIR certifié" if r.get("isCertifieCnav") else "NIR non certifié"
+            click.echo(
+                f"{s.get('idSalarie',''):>16}  {s.get('nom',''):<22} "
+                f"{(s.get('prenoms') or ''):<18} {r.get('typeActivite',''):<5} {actif:<8} {cnav}"
+            )
+
+    _emit(data, as_json, render)
+
+
+@cli.command("salarie", epilog="\b\nExamples:\n  paje salarie 1234567890\n  paje salarie 1234567890 --json")
+@click.argument("id_salarie")
+@click.option("--json", "as_json", is_flag=True, help="Emit raw JSON.")
+@click.pass_context
+def salarie(ctx: click.Context, id_salarie: str, as_json: bool) -> None:
+    """Show the detailed fiche of one salarié (NIR is masked by the URSSAF)."""
+    cdp = _session(ctx)
+    data = _api(cdp, f"/salarie?idSalarie={id_salarie}", "GET")
+    cdp.close()
+
+    def render(d):
+        lieu = d.get("lieuNaissance") or {}
+        click.echo(f"{d.get('typeCivilite','')} {d.get('prenoms','')} {d.get('nomNaissance','')}")
+        click.echo(f"  idSalarie   : {d.get('identifiantDispos','')}")
+        click.echo(f"  NIR (masqué): {d.get('numNir','')}")
+        click.echo(f"  naissance   : {d.get('dtNaissance','')} — "
+                   f"{lieu.get('libCommune') or '?'} ({lieu.get('libPays') or '?'})")
+        click.echo(f"  email       : {d.get('adresseMail','')}")
+
+    _emit(data, as_json, render)
+
+
+@cli.command(
+    "documents",
+    epilog="\b\nExamples:\n  paje documents --from 2025-01 --to 2025-12\n  paje documents --salarie dupont --json",
+)
+@click.option("--type", "doc_type", default="BS", show_default=True, help="Document type code (BS = bulletin).")
+@click.option("--from", "date_from", metavar="YYYY-MM", help="Start period (default 2020-01).")
+@click.option("--to", "date_to", metavar="YYYY-MM", help="End period (default 2035-12).")
+@click.option("--salarie", "salarie_filter", help="Case-insensitive name substring filter.")
+@click.option("--json", "as_json", is_flag=True, help="Emit raw JSON.")
+@click.pass_context
+def documents(ctx, doc_type, date_from, date_to, salarie_filter, as_json) -> None:
+    """List available documents (bulletins de salaire, etc.) over a period range."""
+    cdp = _session(ctx)
+    body = {
+        "typeDocuments": [doc_type],
+        "periodeDeclarationDebut": date_from or "2020-01",
+        "periodeDeclarationFin": date_to or "2035-12",
+    }
+    rows = _api(cdp, "/documents/voletsSociaux/rechercher", "POST", body)
+    cdp.close()
+    if salarie_filter:
+        needle = salarie_filter.lower()
+        rows = [r for r in rows if needle in ((r.get("salarie") or {}).get("nom") or "").lower()]
+
+    def render(items):
+        for r in items:
+            s = r.get("salarie", {})
+            click.echo(
+                f"{r.get('idDeclaration',''):<16} {r.get('cdType','')}  {r.get('periode',''):<12} "
+                f"{s.get('nom',''):<22} {(s.get('prenoms') or ''):<16} net={r.get('mntSalaireNetPaye','')}"
+            )
+
+    _emit(rows, as_json, render)
+
+
+@cli.command(
+    "bulletin",
+    epilog="\b\nExamples:\n  paje bulletin 1234567890 -o bulletin.pdf\n  paje bulletin 1234567890 --rang 1",
+)
+@click.argument("id_declaration")
+@click.option("-o", "--output", type=click.Path(dir_okay=False), help="Output PDF path.")
+@click.option("--rang", default="0", show_default=True, help="rangVSO (volet social rank).")
+@click.pass_context
+def bulletin(ctx, id_declaration, output, rang) -> None:
+    """Download the bulletin de salaire PDF for a declaration id (from `documents`)."""
+    cdp = _session(ctx)
+    body = {
+        "codeParamDoc": "PAJE_BULLETIN_SALAIRE",
+        "criteresAggregation": [
+            {"key": "refDoc", "value": id_declaration},
+            {"key": "rangVSO", "value": str(rang)},
+        ],
+    }
+    data = _api(cdp, "/documents/generer", "POST", body)
+    cdp.close()
+    b64 = data.get("documentData")
+    if not b64:
+        raise click.ClickException("Response had no documentData field.")
+    pdf = base64.b64decode(b64)
+    if not pdf.startswith(b"%PDF"):
+        raise click.ClickException("Decoded payload is not a PDF.")
+    out = Path(output or f"BS_{id_declaration}.pdf")
+    out.write_bytes(pdf)
+    click.echo(f"Saved {out} ({len(pdf)} bytes)")
+
+
+if __name__ == "__main__":
+    cli()

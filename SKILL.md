@@ -11,21 +11,82 @@ salariés, fiches, documents, bulletins de salaire — by running the private
 
 ## How to invoke
 
-Invoke it as **`paje`** — on `$PATH` via a symlink in `~/.local/bin` onto this
-repo's `bin/paje`, so it always runs the current checkout: a `git pull`, or even
-an uncommitted edit, takes effect immediately with nothing to reinstall.
+Invoke it as **`paje`** — on `$PATH` via `claudine/scripts/link_clis.py`, which
+links this repo's `bin/paje` into `~/.local/bin`, so it always runs the current
+checkout: a `git pull`, or even an uncommitted edit, takes effect immediately
+with nothing to reinstall.
 
 ```bash
 paje salaries
 ```
 
-Examples in this doc are written that way. If `paje` is not on `$PATH`, run the
-bundled launcher `bin/paje` resolved against this skill's own directory (PEP 723
-— `uv` resolves deps inline on first run), or link it once:
+If `paje` is not on `$PATH`, run `<skill-dir>/bin/paje` (a symlink to
+`pajemploi_cli.py`, a PEP 723 script — `uv` resolves deps inline on first run).
+
+## Authentication
+
+Nothing to paste and no stored credential: the CLI reuses the live session of a
+logged-in Pajemploi tab. The first command auto-starts a **dedicated debug
+Chrome** (persistent profile `~/.pajemploi-chrome`, coexists with your normal
+Chrome) and opens Pajemploi:
 
 ```bash
-ln -sfn <skill-dir>/bin/paje ~/.local/bin/paje
+paje doctor
 ```
+
+If you're not logged in, log in **by hand** in the Chrome window that opens, then
+re-run — the dedicated profile keeps the session between runs, so you only log in
+when it expires. A `401/403` later means the session expired; log in again there.
+
+Options: `--cdp-url` / `PAJE_CDP_URL` (other port), `--no-launch` (don't auto-start
+Chrome), `--no-reload` (don't reload the tab to capture a token — fail instead).
+
+## Output conventions
+
+- Default: one compact line per record, ids first (`idSalarie`, `idDeclaration`).
+- `--json` on `salaries`, `salarie`, `documents`: the API's JSON as returned.
+- stdout carries data only; diagnostics go to stderr through `logging`
+  (`PAJE_LOG=DEBUG` for verbose).
+- `bulletin` writes the PDF to disk and prints the saved path.
+
+## Commands
+
+```bash
+# Read
+paje doctor                                   # DevTools connection + Pajemploi tab + token capture
+paje salaries [--json]                        # all salariés: id, nom, prénom, activité, actif, NIR certifié CNAV
+paje salarie <idSalarie> [--json]             # fiche: civilité, naissance, lieu, adresse, email, numNir (masked)
+paje documents [--type BS] [--from YYYY-MM] [--to YYYY-MM] [--salarie NAME] [--json]
+                                              # documents over a period; --type BS = bulletin; rows carry idDeclaration
+# Download
+paje bulletin <idDeclaration> [-o PATH] [--rang N]   # bulletin de salaire PDF (base64 -> file)
+```
+
+`--salarie` is a client-side, case-insensitive substring filter on the nom.
+
+## Recipes
+
+```bash
+# Every bulletin of 2025 for one salarié, as PDFs
+paje documents --from 2025-01 --to 2025-12 --salarie dupont --json \
+  | jq -r '.[].idDeclaration' \
+  | while read -r id; do paje bulletin "$id" -o "BS_$id.pdf"; done
+
+# Net salary paid per month
+paje documents --from 2025-01 --to 2025-12 --json | jq -r '.[] | [.periode, .mntSalaireNetPaye] | @tsv'
+```
+
+## Gotchas
+
+- **The NIR is NOT recoverable.** The URSSAF masks it everywhere on the employer
+  side: `paje salarie` → `numNir` masked (`2***********XXX`); the bulletin PDF
+  shows only the **N° Salarié Pajemploi**, never the NIR.
+- The site leaks memory and freezes after a few minutes; the CLI keeps the
+  session alive on its own once the tab has made one authenticated call.
+- Never send `content-type` on a bodyless GET: the preflight is rejected
+  ("Failed to fetch").
+- `prompt=login` is forced by the OAuth client, hence repeated web logins when
+  the session expires.
 
 ## Why it drives a browser (not plain HTTP)
 
@@ -42,54 +103,7 @@ The API requires **two** headers: `authorization: Bearer <…>` and a rolling
 `x-auth-token` (the server rotates the latter on every response). An injected
 hook captures both from the app's own traffic (`window.__pajeAuth` /
 `window.__pajeXat`) and the CLI replays them — so once the tab has made one
-authenticated call, the CLI keeps the session alive on its own (useful: the site
-itself leaks memory and freezes after a few minutes, but the CLI carries on).
-
-## Usage
-
-Nothing to launch by hand. The first command auto-starts a **dedicated debug
-Chrome** (persistent profile `~/.pajemploi-chrome`, coexists with your normal
-Chrome) and opens Pajemploi:
-
-```bash
-paje doctor        # or straight to bin/paje salaries
-```
-
-If you're not logged in, log in **by hand** in the Chrome window that opens, then
-re-run — the dedicated profile keeps the session between runs, so you only log in
-when it expires. A `401/403` later means the session expired; log in again there.
-
-Options: `--cdp-url` / `PAJE_CDP_URL` (other port), `--no-launch` (don't auto-start
-Chrome), `--no-reload`.
-
-## Commands
-
-### `paje doctor`
-Check the DevTools connection, that a Pajemploi tab is found, and that a session
-token was captured (reloads the tab once if the token isn't live yet).
-
-### `paje salaries [--json]`
-List all salariés (id, nom, prénom, activité, actif, NIR certifié CNAV or not).
-
-### `paje salarie <idSalarie> [--json]`
-Detailed fiche: civilité, naissance, lieu, adresse, email — and `numNir`
-**masked by the URSSAF** (see below).
-
-### `paje documents [--type BS] [--from YYYY-MM] [--to YYYY-MM] [--salarie NAME] [--json]`
-List documents over a period range. `--type BS` = bulletin de salaire. Each row
-gives the `idDeclaration` used to download the PDF.
-
-### `paje bulletin <idDeclaration> [-o PATH] [--rang N]`
-Generate and save the bulletin de salaire PDF (base64 → file).
-
-Global options: `--cdp-url`, and `--no-reload` (don't reload the tab to capture a
-token — fail instead).
-
-## Important: the NIR is NOT recoverable
-
-The URSSAF masks the NIR everywhere on the employer side:
-- `paje salarie` → `numNir` masked (`2***********XXX`);
-- the **bulletin de salaire PDF** shows only the **N° Salarié Pajemploi**, never the NIR.
+authenticated call, the CLI keeps the session alive on its own.
 
 ## API contract (for maintenance)
 
@@ -109,7 +123,7 @@ offline_access ods.cedito`, `prompt=login` forced (hence the repeated web logins
 ## Tests
 
 ```bash
-uv run --with pytest --with click --with websocket-client python -m pytest tests/ -q
+uv run --script tests/test_paje.py
 ```
 
 ## Project layout
@@ -118,6 +132,7 @@ uv run --with pytest --with click --with websocket-client python -m pytest tests
 pajemploi-cli/
   SKILL.md            # this file
   README.md
-  bin/paje            # PEP 723 launcher — invoke this (CDP client)
+  pajemploi_cli.py    # the CLI (PEP 723 script, CDP client)
+  bin/paje            # symlink -> ../pajemploi_cli.py — invoke this
   tests/test_paje.py  # unit tests for the pure helpers
 ```
