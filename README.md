@@ -2,6 +2,8 @@
 
 **Visibility: public.**
 
+**Extension: not shipped** as a Claude Desktop extension: it drives a dedicated debug Chrome window the user logs into by hand.
+
 Piloter ton espace **employeur Pajemploi (URSSAF)** depuis le terminal —
 salariés, fiches, documents, bulletins de salaire — en exécutant les appels de
 l'API privée `https://api.urssaf.fr/paje/apaj/v1` **dans ton vrai Chrome**.
